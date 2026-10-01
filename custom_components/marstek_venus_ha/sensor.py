@@ -167,6 +167,42 @@ DIAGNOSTIC_SENSORS: tuple[DiagnosticSensorDescription, ...] = (
         value_fn=lambda c: c.pid_prev_error,
         has_entity_name=True,
     ),
+    DiagnosticSensorDescription(
+        key="price_control_enabled",
+        name="Price Control Enabled",
+        value_fn=lambda c: c.price_control_enabled,
+        has_entity_name=True,
+    ),
+    DiagnosticSensorDescription(
+        key="price_is_cheap",
+        name="Price: Current Period is Cheap",
+        value_fn=lambda c: c.price_is_cheap,
+        has_entity_name=True,
+    ),
+    DiagnosticSensorDescription(
+        key="price_is_expensive",
+        name="Price: Current Period is Expensive",
+        value_fn=lambda c: c.price_is_expensive,
+        has_entity_name=True,
+    ),
+    DiagnosticSensorDescription(
+        key="price_current_ranking",
+        name="Price: Current Ranking",
+        value_fn=lambda c: c.price_current_ranking,
+        has_entity_name=True,
+    ),
+    DiagnosticSensorDescription(
+        key="solar_forecast_enabled",
+        name="Solar Forecast Charge Spreading Enabled",
+        value_fn=lambda c: c.solar_forecast_enabled,
+        has_entity_name=True,
+    ),
+    DiagnosticSensorDescription(
+        key="solar_forecast_charge_factor",
+        name="Solar Forecast Charge Factor",
+        value_fn=lambda c: c.solar_forecast_charge_factor,
+        has_entity_name=True,
+    ),
 )
 
 

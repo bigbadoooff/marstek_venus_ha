@@ -2,3 +2,4 @@ dev-instance/config
 logfile*.txt
 *.pyc
 __pycache__
+deploy.config.ps1

@@ -19,7 +19,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
         ChargingSwitch(entry, coordinator),
         DischargingSwitch(entry, coordinator),
         WallboxPrioritySwitch(entry, coordinator),
-        BlockDischargingCCSwitch(entry, coordinator)
+        BlockDischargingCCSwitch(entry, coordinator),
+        PriceControlSwitch(entry, coordinator),
+        SolarForecastSwitch(entry, coordinator),
     ])
 
 
@@ -308,6 +310,131 @@ class BlockDischargingCCSwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs):
         self._data._block_discharging_while_carcharging = False
+        await self._data.async_save_settings()
+        self.async_write_ha_state()
+        async_dispatcher_send(self.hass, SIGNAL_DIAGNOSTICS_UPDATED)
+        if hasattr(self._data, "async_request_update"):
+            self.hass.async_create_task(self._data.async_request_update(reason="switch_toggle"))
+
+
+class PriceControlSwitch(SwitchEntity):
+    """Switch to enable/disable price-based battery control.
+
+    When enabled the coordinator uses the configured electricity price sensor
+    to decide whether to force-charge (cheap price), block discharge (cheap),
+    or block charging (expensive price).
+    """
+
+    def __init__(self, entry: ConfigEntry, data_object: MarstekCoordinator):
+        self._entry = entry
+        self._data = data_object
+        self._attr_name = "Price-based Control"
+        self._attr_unique_id = f"{entry.entry_id}_price_control_switch"
+
+    @property
+    def available(self) -> bool:
+        return bool(self._data.is_running)
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._data._price_control_enabled)
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name="Marstek Venus HA",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                SIGNAL_DIAGNOSTICS_UPDATED,
+                self._handle_coordinator_update,
+            )
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs):
+        self._data._price_control_enabled = True
+        await self._data.async_save_settings()
+        self.async_write_ha_state()
+        async_dispatcher_send(self.hass, SIGNAL_DIAGNOSTICS_UPDATED)
+        if hasattr(self._data, "async_request_update"):
+            self.hass.async_create_task(self._data.async_request_update(reason="switch_toggle"))
+
+    async def async_turn_off(self, **kwargs):
+        self._data._price_control_enabled = False
+        # Clear transient price flags so the normal algorithm takes over immediately.
+        self._data._price_is_cheap = False
+        self._data._price_is_expensive = False
+        self._data._price_current_ranking = None
+        self._data._price_cheap_charge_soc_override = None
+        await self._data.async_save_settings()
+        self.async_write_ha_state()
+        async_dispatcher_send(self.hass, SIGNAL_DIAGNOSTICS_UPDATED)
+        if hasattr(self._data, "async_request_update"):
+            self.hass.async_create_task(self._data.async_request_update(reason="switch_toggle"))
+
+
+class SolarForecastSwitch(SwitchEntity):
+    """Switch to enable/disable solar forecast charge spreading.
+
+    When enabled the coordinator uses the configured solar forecast sensor to
+    compute a charge scaling factor so the battery fills up "just in time"
+    rather than absorbing all available surplus early in the day.
+    """
+
+    def __init__(self, entry: ConfigEntry, data_object: MarstekCoordinator):
+        self._entry = entry
+        self._data = data_object
+        self._attr_name = "Solar Forecast Charge Spreading"
+        self._attr_icon = "mdi:solar-power-variant"
+        self._attr_unique_id = f"{entry.entry_id}_solar_forecast_switch"
+
+    @property
+    def available(self) -> bool:
+        return bool(self._data.is_running)
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._data._solar_forecast_enabled)
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name="Marstek Venus HA",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                SIGNAL_DIAGNOSTICS_UPDATED,
+                self._handle_coordinator_update,
+            )
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs):
+        self._data._solar_forecast_enabled = True
+        await self._data.async_save_settings()
+        self.async_write_ha_state()
+        async_dispatcher_send(self.hass, SIGNAL_DIAGNOSTICS_UPDATED)
+        if hasattr(self._data, "async_request_update"):
+            self.hass.async_create_task(self._data.async_request_update(reason="switch_toggle"))
+
+    async def async_turn_off(self, **kwargs):
+        self._data._solar_forecast_enabled = False
+        self._data._solar_forecast_charge_factor = 1.0
         await self._data.async_save_settings()
         self.async_write_ha_state()
         async_dispatcher_send(self.hass, SIGNAL_DIAGNOSTICS_UPDATED)

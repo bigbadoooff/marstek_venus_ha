@@ -104,3 +104,21 @@ DEFAULT_PID_KI = 0.02
 DEFAULT_PID_KD = 0.0
 DEFAULT_PID_FEEDFORWARD_ENABLED = False
 DEFAULT_PID_FEEDFORWARD_GAIN = 0.7
+
+# Price-based control
+CONF_PRICE_SENSOR = "price_sensor"
+CONF_PRICE_CHEAP_QUANTILE = "price_cheap_quantile"
+CONF_PRICE_EXPENSIVE_QUANTILE = "price_expensive_quantile"
+CONF_PRICE_CHEAP_CHARGE_SOC = "price_cheap_charge_soc"
+CONF_PRICE_RANKING_ATTRIBUTE = "price_ranking_attribute"
+
+DEFAULT_PRICE_CHEAP_QUANTILE = 0.10
+DEFAULT_PRICE_EXPENSIVE_QUANTILE = 0.80
+DEFAULT_PRICE_CHEAP_CHARGE_SOC = 80
+DEFAULT_PRICE_RANKING_ATTRIBUTE = "intraday_price_ranking"
+
+# Solar forecast-based charge spreading
+CONF_SOLAR_FORECAST_SENSOR = "solar_forecast_sensor"
+CONF_SOLAR_FORECAST_TRIGGER_BUFFER = "solar_forecast_trigger_buffer"
+DEFAULT_BATTERY_CAPACITY_WH = 5000
+DEFAULT_SOLAR_FORECAST_TRIGGER_BUFFER = 0.1  # start charging when remaining solar ≤ energy_needed × 1.1

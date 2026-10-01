@@ -83,7 +83,20 @@ from .const import (
     DEFAULT_DISCHARGE_POWER_LEVEL_4,
     DEFAULT_DISCHARGE_POWER_LEVEL_5,
     CONF_BATTERY_COUNT,
-    DEFAULT_BATTERY_COUNT
+    DEFAULT_BATTERY_COUNT,
+    CONF_PRICE_SENSOR,
+    CONF_PRICE_CHEAP_QUANTILE,
+    CONF_PRICE_EXPENSIVE_QUANTILE,
+    CONF_PRICE_CHEAP_CHARGE_SOC,
+    CONF_PRICE_RANKING_ATTRIBUTE,
+    DEFAULT_PRICE_CHEAP_QUANTILE,
+    DEFAULT_PRICE_EXPENSIVE_QUANTILE,
+    DEFAULT_PRICE_CHEAP_CHARGE_SOC,
+    DEFAULT_PRICE_RANKING_ATTRIBUTE,
+    CONF_SOLAR_FORECAST_SENSOR,
+    CONF_SOLAR_FORECAST_TRIGGER_BUFFER,
+    DEFAULT_BATTERY_CAPACITY_WH,
+    DEFAULT_SOLAR_FORECAST_TRIGGER_BUFFER,
 )
 
 class MarstekConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -141,6 +154,7 @@ class MarstekConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             schema_dict[vol.Required(f"battery_{i}_discharge_power_entity")] = selector.EntitySelector(selector.EntitySelectorConfig(domain="number"))
             schema_dict[vol.Required(f"battery_{i}_force_mode_entity")] = selector.EntitySelector(selector.EntitySelectorConfig(domain="select"))
             schema_dict[vol.Required(f"battery_{i}_rs485_mode_entity")] = selector.EntitySelector(selector.EntitySelectorConfig(domain="switch"))
+            schema_dict[vol.Required(f"battery_{i}_capacity_wh", default=DEFAULT_BATTERY_CAPACITY_WH)] = int
 
         # Generate powerstages based on battery number
         if battery_count > 1:
@@ -210,10 +224,7 @@ class MarstekConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
         if user_input is not None:
             self._data.update(user_input)
-            return self.async_create_entry(
-                title="Marstek Venus HA Integration",
-                data=self._data,
-            )
+            return await self.async_step_price()
 
         data_schema = vol.Schema(
             {
@@ -226,6 +237,67 @@ class MarstekConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }
         )
         return self.async_show_form(step_id="pid", data_schema=data_schema, errors=errors)
+
+    async def async_step_price(self, user_input=None):
+        """Variable electricity price configuration step."""
+        errors = {}
+        if user_input is not None:
+            if CONF_PRICE_SENSOR not in user_input:
+                user_input[CONF_PRICE_SENSOR] = None
+            self._data.update(user_input)
+            return await self.async_step_solar_forecast()
+
+        data_schema = vol.Schema(
+            {
+                vol.Optional(CONF_PRICE_SENSOR): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")
+                ),
+                vol.Required(
+                    CONF_PRICE_CHEAP_QUANTILE, default=DEFAULT_PRICE_CHEAP_QUANTILE
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.0, max=0.5, step=0.01, mode="box")
+                ),
+                vol.Required(
+                    CONF_PRICE_EXPENSIVE_QUANTILE, default=DEFAULT_PRICE_EXPENSIVE_QUANTILE
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.5, max=1.0, step=0.01, mode="box")
+                ),
+                vol.Required(
+                    CONF_PRICE_CHEAP_CHARGE_SOC, default=DEFAULT_PRICE_CHEAP_CHARGE_SOC
+                ): vol.All(vol.Coerce(int), vol.Range(min=10, max=100)),
+                vol.Required(
+                    CONF_PRICE_RANKING_ATTRIBUTE, default=DEFAULT_PRICE_RANKING_ATTRIBUTE
+                ): str,
+            }
+        )
+        return self.async_show_form(step_id="price", data_schema=data_schema, errors=errors)
+
+    async def async_step_solar_forecast(self, user_input=None):
+        """Solar forecast charge spreading configuration step."""
+        errors = {}
+        if user_input is not None:
+            if CONF_SOLAR_FORECAST_SENSOR not in user_input:
+                user_input[CONF_SOLAR_FORECAST_SENSOR] = None
+            self._data.update(user_input)
+            return self.async_create_entry(
+                title="Marstek Venus HA Integration",
+                data=self._data,
+            )
+
+        data_schema = vol.Schema(
+            {
+                vol.Optional(CONF_SOLAR_FORECAST_SENSOR): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")
+                ),
+                vol.Required(
+                    CONF_SOLAR_FORECAST_TRIGGER_BUFFER,
+                    default=DEFAULT_SOLAR_FORECAST_TRIGGER_BUFFER,
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.01, mode="box")
+                ),
+            }
+        )
+        return self.async_show_form(step_id="solar_forecast", data_schema=data_schema, errors=errors)
 
     @staticmethod
     def async_get_options_flow(config_entry):
@@ -248,7 +320,7 @@ class MarstekOptionsFlowHandler(config_entries.OptionsFlow):
         self._all_mode = False
         return self.async_show_menu(
             step_id="init",
-            menu_options=["all", "basic", "batteries", "wallbox", "pid"],
+            menu_options=["all", "basic", "batteries", "wallbox", "pid", "price", "solar_forecast"],
         )
 
     async def async_step_all(self, user_input=None):
@@ -347,6 +419,11 @@ class MarstekOptionsFlowHandler(config_entries.OptionsFlow):
                 f"battery_{i}_rs485_mode_entity",
                 default=self._options.get(f"battery_{i}_rs485_mode_entity", self.config_entry.data.get(f"battery_{i}_rs485_mode_entity", ""))
             )] = selector.EntitySelector(selector.EntitySelectorConfig(domain="switch"))
+
+            schema_dict[vol.Required(
+                f"battery_{i}_capacity_wh",
+                default=self._options.get(f"battery_{i}_capacity_wh", self.config_entry.data.get(f"battery_{i}_capacity_wh", DEFAULT_BATTERY_CAPACITY_WH))
+            )] = int
 
         # 2. Dynamische Powerstages (nur wenn mehr als 1 Batterie)
         if battery_count > 1:
@@ -448,6 +525,8 @@ class MarstekOptionsFlowHandler(config_entries.OptionsFlow):
         """PID configuration step."""
         if user_input is not None:
             self._options.update(user_input)
+            if self._all_mode:
+                return await self.async_step_price()
             return self.async_create_entry(title="", data=self._options)
 
         data_schema = vol.Schema(
@@ -479,3 +558,67 @@ class MarstekOptionsFlowHandler(config_entries.OptionsFlow):
             }
         )
         return self.async_show_form(step_id="pid", data_schema=data_schema)
+
+    async def async_step_price(self, user_input=None):
+        """Variable electricity price options step."""
+        if user_input is not None:
+            if CONF_PRICE_SENSOR not in user_input:
+                user_input[CONF_PRICE_SENSOR] = None
+            self._options.update(user_input)
+            if self._all_mode:
+                return await self.async_step_solar_forecast()
+            return self.async_create_entry(title="", data=self._options)
+
+        data_schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_PRICE_SENSOR,
+                    description={"suggested_value": self._options.get(CONF_PRICE_SENSOR, self.config_entry.data.get(CONF_PRICE_SENSOR))},
+                ): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
+                vol.Required(
+                    CONF_PRICE_CHEAP_QUANTILE,
+                    default=self._options.get(CONF_PRICE_CHEAP_QUANTILE, self.config_entry.data.get(CONF_PRICE_CHEAP_QUANTILE, DEFAULT_PRICE_CHEAP_QUANTILE)),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.0, max=0.5, step=0.01, mode="box")
+                ),
+                vol.Required(
+                    CONF_PRICE_EXPENSIVE_QUANTILE,
+                    default=self._options.get(CONF_PRICE_EXPENSIVE_QUANTILE, self.config_entry.data.get(CONF_PRICE_EXPENSIVE_QUANTILE, DEFAULT_PRICE_EXPENSIVE_QUANTILE)),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.5, max=1.0, step=0.01, mode="box")
+                ),
+                vol.Required(
+                    CONF_PRICE_CHEAP_CHARGE_SOC,
+                    default=self._options.get(CONF_PRICE_CHEAP_CHARGE_SOC, self.config_entry.data.get(CONF_PRICE_CHEAP_CHARGE_SOC, DEFAULT_PRICE_CHEAP_CHARGE_SOC)),
+                ): vol.All(vol.Coerce(int), vol.Range(min=10, max=100)),
+                vol.Required(
+                    CONF_PRICE_RANKING_ATTRIBUTE,
+                    default=self._options.get(CONF_PRICE_RANKING_ATTRIBUTE, self.config_entry.data.get(CONF_PRICE_RANKING_ATTRIBUTE, DEFAULT_PRICE_RANKING_ATTRIBUTE)),
+                ): str,
+            }
+        )
+        return self.async_show_form(step_id="price", data_schema=data_schema)
+
+    async def async_step_solar_forecast(self, user_input=None):
+        """Solar forecast charge spreading options step."""
+        if user_input is not None:
+            if CONF_SOLAR_FORECAST_SENSOR not in user_input:
+                user_input[CONF_SOLAR_FORECAST_SENSOR] = None
+            self._options.update(user_input)
+            return self.async_create_entry(title="", data=self._options)
+
+        data_schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_SOLAR_FORECAST_SENSOR,
+                    description={"suggested_value": self._options.get(CONF_SOLAR_FORECAST_SENSOR, self.config_entry.data.get(CONF_SOLAR_FORECAST_SENSOR))},
+                ): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
+                vol.Required(
+                    CONF_SOLAR_FORECAST_TRIGGER_BUFFER,
+                    default=self._options.get(CONF_SOLAR_FORECAST_TRIGGER_BUFFER, self.config_entry.data.get(CONF_SOLAR_FORECAST_TRIGGER_BUFFER, DEFAULT_SOLAR_FORECAST_TRIGGER_BUFFER)),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.0, max=1.0, step=0.01, mode="box")
+                ),
+            }
+        )
+        return self.async_show_form(step_id="solar_forecast", data_schema=data_schema)

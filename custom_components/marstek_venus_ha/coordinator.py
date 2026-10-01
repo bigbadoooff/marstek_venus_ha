@@ -78,6 +78,19 @@ from .const import (
     DEFAULT_PID_KD,
     DEFAULT_PID_FEEDFORWARD_ENABLED,
     DEFAULT_PID_FEEDFORWARD_GAIN,
+    CONF_PRICE_SENSOR,
+    CONF_PRICE_CHEAP_QUANTILE,
+    CONF_PRICE_EXPENSIVE_QUANTILE,
+    CONF_PRICE_CHEAP_CHARGE_SOC,
+    CONF_PRICE_RANKING_ATTRIBUTE,
+    DEFAULT_PRICE_CHEAP_QUANTILE,
+    DEFAULT_PRICE_EXPENSIVE_QUANTILE,
+    DEFAULT_PRICE_CHEAP_CHARGE_SOC,
+    DEFAULT_PRICE_RANKING_ATTRIBUTE,
+    CONF_SOLAR_FORECAST_SENSOR,
+    CONF_SOLAR_FORECAST_TRIGGER_BUFFER,
+    DEFAULT_BATTERY_CAPACITY_WH,
+    DEFAULT_SOLAR_FORECAST_TRIGGER_BUFFER,
     DEFAULT_CHARGE_POWER_LEVEL_1,
     DEFAULT_CHARGE_POWER_LEVEL_2,
     DEFAULT_CHARGE_POWER_LEVEL_3,
@@ -200,6 +213,17 @@ class MarstekCoordinator:
         self._charge_suspended = False
         self._discharge_suspended = False
 
+        # Price-based control state
+        self._price_control_enabled = False
+        self._price_is_cheap = False
+        self._price_is_expensive = False
+        self._price_current_ranking: float | None = None
+        self._price_cheap_charge_soc_override: int | None = None
+
+        # Solar forecast charge spreading state
+        self._solar_forecast_enabled = False
+        self._solar_forecast_charge_factor: float = 1.0
+
         # Collect battery entities
         self._battery_count = int(self.config.get(CONF_BATTERY_COUNT, 1))
         self._batteries = []
@@ -218,6 +242,7 @@ class MarstekCoordinator:
                     "discharge_power": self.config.get(f"battery_{i}_discharge_power_entity"),
                     "force_mode": self.config.get(f"battery_{i}_force_mode_entity"),
                     "rs485_mode": self.config.get(f"battery_{i}_rs485_mode_entity"),
+                    "capacity_wh": self.config.get(f"battery_{i}_capacity_wh", DEFAULT_BATTERY_CAPACITY_WH),
                 })
     
     async def async_load_settings(self) -> None:
@@ -230,6 +255,8 @@ class MarstekCoordinator:
             self._allow_discharging = stored_data.get("allow_discharging", True)
             self._block_discharging_while_carcharging = stored_data.get("block_discharging_while_carcharging", True)
             self._wallbox_priority = stored_data.get("wallbox_priority", True)
+            self._price_control_enabled = stored_data.get("price_control_enabled", False)
+            self._solar_forecast_enabled = stored_data.get("solar_forecast_enabled", False)
         else:
             # If no store exists yet, use your defaults
             self._control_enabled = True
@@ -237,6 +264,8 @@ class MarstekCoordinator:
             self._allow_discharging = True
             self._block_discharging_while_carcharging = True
             self._wallbox_priority = True
+            self._price_control_enabled = False
+            self._solar_forecast_enabled = False
 
     async def async_save_settings(self) -> None:
         """Save current settings to store."""
@@ -246,6 +275,8 @@ class MarstekCoordinator:
             "allow_discharging": self._allow_discharging,
             "block_discharging_while_carcharging": self._block_discharging_while_carcharging,
             "wallbox_priority": self._wallbox_priority,
+            "price_control_enabled": self._price_control_enabled,
+            "solar_forecast_enabled": self._solar_forecast_enabled,
             # include all other persisted flags here
         })
 
@@ -435,6 +466,30 @@ class MarstekCoordinator:
     @property
     def pid_prev_error(self) -> float | None:
         return self._pid_prev_error
+
+    @property
+    def price_control_enabled(self) -> bool:
+        return bool(self._price_control_enabled)
+
+    @property
+    def price_is_cheap(self) -> bool:
+        return bool(self._price_is_cheap)
+
+    @property
+    def price_is_expensive(self) -> bool:
+        return bool(self._price_is_expensive)
+
+    @property
+    def price_current_ranking(self) -> float | None:
+        return self._price_current_ranking
+
+    @property
+    def solar_forecast_enabled(self) -> bool:
+        return bool(self._solar_forecast_enabled)
+
+    @property
+    def solar_forecast_charge_factor(self) -> float:
+        return self._solar_forecast_charge_factor
 
     @property
     def wallbox_cooldown_end_iso(self) -> str | None:
@@ -804,6 +859,255 @@ class MarstekCoordinator:
             return None
         return state
 
+    def _get_price_ranking(self, price_sensor_id: str) -> float | None:
+        """Return the current price's intraday quantile rank in [0, 1].
+
+        0 = cheapest hour of the day, 1 = most expensive hour.
+        Primary source: the configured ranking attribute on the price sensor
+        (default: ``intraday_price_ranking``).
+        Fallback: linear interpolation between today's min and max price.
+        Returns None when the price sensor is unavailable or the ranking
+        cannot be determined — the caller should fall back to the normal
+        surplus-based algorithm.
+        """
+        state = self.hass.states.get(price_sensor_id)
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            _LOGGER.debug("Price sensor '%s' unavailable. Skipping price logic.", price_sensor_id)
+            return None
+
+        # Primary: use the dedicated ranking attribute (0-1 percentile rank)
+        ranking_attr = self.config.get(CONF_PRICE_RANKING_ATTRIBUTE, DEFAULT_PRICE_RANKING_ATTRIBUTE)
+        ranking_val = state.attributes.get(ranking_attr)
+        if ranking_val is not None:
+            try:
+                ranking = float(ranking_val)
+                if 0.0 <= ranking <= 1.0:
+                    _LOGGER.debug("Price ranking from attribute '%s': %.3f", ranking_attr, ranking)
+                    return ranking
+            except (ValueError, TypeError):
+                pass
+
+        # Fallback: compute from today's min/max price attributes
+        try:
+            current_price = float(state.state)
+            attrs = state.attributes
+            min_price_raw = attrs.get("min_price") or attrs.get("today_min") or attrs.get("Min price")
+            max_price_raw = attrs.get("max_price") or attrs.get("today_max") or attrs.get("Max price")
+            if min_price_raw is not None and max_price_raw is not None:
+                min_price = float(min_price_raw)
+                max_price = float(max_price_raw)
+                if max_price > min_price:
+                    ranking = (current_price - min_price) / (max_price - min_price)
+                    ranking = max(0.0, min(1.0, ranking))
+                    _LOGGER.debug(
+                        "Price ranking computed from min/max: %.3f (current=%.4f, min=%.4f, max=%.4f)",
+                        ranking, current_price, min_price, max_price,
+                    )
+                    return ranking
+        except (ValueError, TypeError):
+            pass
+
+        _LOGGER.warning(
+            "Could not determine price ranking from sensor '%s'. "
+            "Ensure the sensor exposes a '%s' attribute or min/max price attributes.",
+            price_sensor_id, ranking_attr,
+        )
+        return None
+
+    def _compute_solar_charge_factor(self) -> float:
+        """Determine whether to allow or block solar charging based on forecast.
+
+        Binary threshold: block charging completely while remaining solar exceeds
+        the battery's free capacity (plus a configurable buffer), then allow
+        full-power charging the moment it drops at or below that threshold.
+
+        trigger = energy_needed_wh × (1 + trigger_buffer)
+          remaining_solar > trigger  →  return 0.0  (block — too much solar left)
+          remaining_solar ≤ trigger  →  return 1.0  (charge at full power)
+
+        Returns 1.0 (allow full charge) when:
+          - No forecast sensor configured
+          - Sensor unavailable or non-numeric
+          - remaining solar ≤ 0 (after sunset / no data)
+          - All batteries already at target SoC
+        """
+        sensor_id = self.config.get(CONF_SOLAR_FORECAST_SENSOR)
+        if not sensor_id:
+            return 1.0
+
+        state = self.hass.states.get(sensor_id)
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            _LOGGER.debug("Solar forecast sensor '%s' unavailable. Using factor=1.0.", sensor_id)
+            return 1.0
+
+        try:
+            remaining_solar_kwh = float(state.state)
+        except (ValueError, TypeError):
+            _LOGGER.debug(
+                "Solar forecast sensor '%s' state non-numeric: %s. Using factor=1.0.",
+                sensor_id, state.state,
+            )
+            return 1.0
+
+        if remaining_solar_kwh <= 0.0:
+            # No solar left today — charge at full speed (e.g., evening/night)
+            return 1.0
+
+        remaining_solar_wh = remaining_solar_kwh * 1000.0
+
+        # Calculate total energy needed to reach max_soc across all batteries
+        try:
+            target_soc = float(self.config.get(CONF_MAX_SOC, DEFAULT_MAX_SOC) or DEFAULT_MAX_SOC)
+        except (ValueError, TypeError):
+            target_soc = float(DEFAULT_MAX_SOC)
+
+        energy_needed_wh = 0.0
+        for batt in self._batteries:
+            try:
+                cap_wh = float(batt.get("capacity_wh") or DEFAULT_BATTERY_CAPACITY_WH)
+            except (ValueError, TypeError):
+                cap_wh = float(DEFAULT_BATTERY_CAPACITY_WH)
+
+            soc = self._get_float_state(batt["soc"])
+            if soc is None:
+                continue
+            energy_needed_wh += max(0.0, cap_wh * (target_soc - soc) / 100.0)
+
+        if energy_needed_wh <= 0.0:
+            # Already at target — no restriction needed
+            return 1.0
+
+        try:
+            trigger_buffer = float(
+                self.config.get(CONF_SOLAR_FORECAST_TRIGGER_BUFFER, DEFAULT_SOLAR_FORECAST_TRIGGER_BUFFER)
+            )
+        except (ValueError, TypeError):
+            trigger_buffer = float(DEFAULT_SOLAR_FORECAST_TRIGGER_BUFFER)
+
+        trigger_wh = energy_needed_wh * (1.0 + trigger_buffer)
+
+        if remaining_solar_wh > trigger_wh:
+            _LOGGER.debug(
+                "Solar forecast: blocking charge — remaining=%.2fkWh > trigger=%.0fWh "
+                "(needed=%.0fWh, buffer=%.0f%%)",
+                remaining_solar_kwh, trigger_wh, energy_needed_wh, trigger_buffer * 100,
+            )
+            return 0.0
+
+        _LOGGER.debug(
+            "Solar forecast: starting full-power charge — remaining=%.2fkWh ≤ trigger=%.0fWh "
+            "(needed=%.0fWh, buffer=%.0f%%)",
+            remaining_solar_kwh, trigger_wh, energy_needed_wh, trigger_buffer * 100,
+        )
+        return 1.0
+
+    async def _handle_price_logic(self) -> bool:
+        """Apply price-based battery control.
+
+        Evaluates the current price ranking and sets transient flags used by
+        ``_calculate_battery_priority()``:
+
+        * Cheap period (ranking ≤ cheap_quantile):
+          - Force-charge at max power from the grid up to the configured SoC
+            target.  Returns True so the caller skips the normal algorithm.
+          - If batteries are already at/above the SoC target, just set the
+            block-discharge flag and return False (normal algorithm continues
+            with discharge blocked).
+
+        * Expensive period (ranking ≥ expensive_quantile):
+          - Set block-charge flag.  Returns False so the normal discharge
+            algorithm continues.
+
+        * Normal period: clear all flags and return False.
+        """
+        # Always reset transient flags at the top of each call.
+        self._price_is_cheap = False
+        self._price_is_expensive = False
+        self._price_current_ranking = None
+        self._price_cheap_charge_soc_override = None
+
+        price_sensor_id = self.config.get(CONF_PRICE_SENSOR)
+        if not isinstance(price_sensor_id, str) or not price_sensor_id:
+            _LOGGER.debug("Price sensor not configured. Skipping price logic.")
+            return False
+
+        ranking = self._get_price_ranking(price_sensor_id)
+        if ranking is None:
+            return False  # Sensor unavailable — fall back to normal algorithm
+
+        self._price_current_ranking = ranking
+
+        try:
+            cheap_quantile = float(self.config.get(CONF_PRICE_CHEAP_QUANTILE, DEFAULT_PRICE_CHEAP_QUANTILE))
+            expensive_quantile = float(self.config.get(CONF_PRICE_EXPENSIVE_QUANTILE, DEFAULT_PRICE_EXPENSIVE_QUANTILE))
+        except (ValueError, TypeError):
+            cheap_quantile = float(DEFAULT_PRICE_CHEAP_QUANTILE)
+            expensive_quantile = float(DEFAULT_PRICE_EXPENSIVE_QUANTILE)
+
+        self._price_is_cheap = ranking <= cheap_quantile
+        self._price_is_expensive = ranking >= expensive_quantile
+
+        if self._price_is_cheap:
+            try:
+                cheap_charge_target = int(self.config.get(CONF_PRICE_CHEAP_CHARGE_SOC, DEFAULT_PRICE_CHEAP_CHARGE_SOC))
+            except (ValueError, TypeError):
+                cheap_charge_target = int(DEFAULT_PRICE_CHEAP_CHARGE_SOC)
+
+            # Check whether any battery still needs charging below the target SoC.
+            needs_charging = any(
+                (soc := self._get_float_state(batt["soc"])) is not None and soc < cheap_charge_target
+                for batt in self._batteries
+            )
+
+            if needs_charging:
+                _LOGGER.info(
+                    "Price is CHEAP (ranking=%.2f ≤ %.2f). Force-charging from grid. SoC target: %d%%.",
+                    ranking, cheap_quantile, cheap_charge_target,
+                )
+                # Override direction to CHARGE and let the priority engine use the
+                # SoC target as the effective max_soc (stops charging at the target).
+                self._last_power_direction = PowerDir.CHARGE
+                self._price_cheap_charge_soc_override = cheap_charge_target
+
+                # Force a priority recalculation for the CHARGE direction.
+                self._battery_priority = []
+                await self._update_battery_priority_if_needed()
+
+                if not self._battery_priority:
+                    _LOGGER.debug("Price force-charge: no eligible batteries. Falling back to normal algorithm.")
+                    self._price_cheap_charge_soc_override = None
+                    return False
+
+                try:
+                    max_charge_power = int(self.config.get(CONF_MAX_CHARGE_POWER, DEFAULT_MAX_CHARGE_POWER))
+                except (ValueError, TypeError):
+                    max_charge_power = int(DEFAULT_MAX_CHARGE_POWER)
+
+                num_batteries = len(self._battery_priority)
+                total_power = float(max_charge_power * num_batteries)
+                await self._distribute_power(total_power, num_batteries)
+                return True  # Took control — skip normal algorithm
+            else:
+                _LOGGER.debug(
+                    "Price is cheap (ranking=%.2f) but all batteries at/above SoC target (%d%%). "
+                    "Discharge blocked, normal charging algorithm continues.",
+                    ranking, cheap_charge_target,
+                )
+                # Discharge will be blocked via _price_is_cheap in _calculate_battery_priority().
+                return False
+
+        if self._price_is_expensive:
+            _LOGGER.debug(
+                "Price is EXPENSIVE (ranking=%.2f ≥ %.2f). Blocking charging; discharge runs normally.",
+                ranking, expensive_quantile,
+            )
+            # Charging will be blocked via _price_is_expensive in _calculate_battery_priority().
+            return False
+
+        # Normal price period — flags are already False, normal algorithm continues.
+        _LOGGER.debug("Price is normal (ranking=%.2f). Normal algorithm active.", ranking)
+        return False
+
     async def _async_update(self, now=None):
         """Fetch new data and run the logic."""
         # Note: logging is handled by _run_update to include a reason.
@@ -839,7 +1143,24 @@ class MarstekCoordinator:
             self._pid_prev_error = None
             self._pid_prev_ts = None
             return
-        
+
+        # Solar forecast charge spreading: compute factor before price logic so
+        # the cap applies to all charging paths (including price force-charge).
+        if self._solar_forecast_enabled:
+            self._solar_forecast_charge_factor = self._compute_solar_charge_factor()
+        else:
+            self._solar_forecast_charge_factor = 1.0
+
+        # Price-based control: force-charge when cheap, block discharge when cheap,
+        # block charging when expensive.
+        if self._price_control_enabled:
+            price_took_control = await self._handle_price_logic()
+            if price_took_control:
+                _LOGGER.debug("Price logic took control (force-charge). Ending update cycle.")
+                if self._pid_enabled:
+                    self._reset_pid_state()
+                return
+
         # check if power is below thresholds for too long and if so, set all batteries to 0W and suspend PID if active
         is_below_threshold = await self._check_power_thresholds(real_power)
         if is_below_threshold:
@@ -1480,6 +1801,17 @@ class MarstekCoordinator:
             _LOGGER.debug("Discharging is disabled. Setting battery priority to empty for discharging.")
             return
 
+        # Price-based overrides: block discharge when price is cheap, block charging when expensive.
+        if self._price_control_enabled:
+            if self._price_is_cheap and self._last_power_direction == PowerDir.DISCHARGE:
+                self._battery_priority = []
+                _LOGGER.debug("Price control: cheap price — blocking discharge to conserve charge for expensive periods.")
+                return
+            if self._price_is_expensive and self._last_power_direction == PowerDir.CHARGE:
+                self._battery_priority = []
+                _LOGGER.debug("Price control: expensive price — blocking charging to maximise discharge capacity.")
+                return
+
         try:
             min_soc = float(self.config.get(CONF_MIN_SOC, DEFAULT_MIN_SOC) or DEFAULT_MIN_SOC)
         except (TypeError, ValueError):
@@ -1488,7 +1820,15 @@ class MarstekCoordinator:
             max_soc = float(self.config.get(CONF_MAX_SOC, DEFAULT_MAX_SOC) or DEFAULT_MAX_SOC)
         except (TypeError, ValueError):
             max_soc = float(DEFAULT_MAX_SOC)
-        
+
+        # When force-charging during cheap periods, use the cheap-charge SoC target as the upper
+        # limit so that force-charging stops once batteries have reached the configured SoC target.
+        effective_max_soc = (
+            float(self._price_cheap_charge_soc_override)
+            if (self._price_control_enabled and self._price_cheap_charge_soc_override is not None)
+            else max_soc
+        )
+
         available_batteries = []
         missing_soc: list[str] = []
         for batt in self._batteries:
@@ -1500,7 +1840,7 @@ class MarstekCoordinator:
             batt_copy = dict(batt)
             batt_copy["current_soc"] = soc
 
-            if self._last_power_direction == PowerDir.CHARGE and soc <= max_soc:
+            if self._last_power_direction == PowerDir.CHARGE and soc <= effective_max_soc:
                 available_batteries.append(batt_copy)
             elif self._last_power_direction == PowerDir.DISCHARGE and soc >= min_soc:
                 available_batteries.append(batt_copy)
@@ -1764,6 +2104,26 @@ class MarstekCoordinator:
                         round(capped, 0),
                     )
                     abs_power = capped
+
+        # Solar forecast charge spreading: rate-limit charging to fill "just in time".
+        # The factor is pre-computed each cycle in _async_update and is 1.0 when
+        # remaining solar ≤ energy needed (i.e., charge at full speed).
+        if (
+            self._last_power_direction == PowerDir.CHARGE
+            and self._solar_forecast_enabled
+            and self._solar_forecast_charge_factor < 1.0
+        ):
+            if self._solar_forecast_charge_factor <= 0.0:
+                _LOGGER.debug("Solar forecast: factor=0 — blocking charging (surplus far exceeds battery need).")
+                await self._set_all_batteries_to_zero()
+                return
+            cap = float(max_charge_power) * target_num_batteries * self._solar_forecast_charge_factor
+            if abs_power > cap:
+                _LOGGER.debug(
+                    "Solar forecast: capping charge %.0fW → %.0fW (factor=%.2f, batteries=%d)",
+                    abs_power, cap, self._solar_forecast_charge_factor, target_num_batteries,
+                )
+                abs_power = cap
 
         if abs_power != requested_abs_power:
             _LOGGER.debug(
