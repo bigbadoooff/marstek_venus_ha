@@ -101,6 +101,13 @@ from .const import (
     DEFAULT_DISCHARGE_POWER_LEVEL_3,
     DEFAULT_DISCHARGE_POWER_LEVEL_4,
     DEFAULT_DISCHARGE_POWER_LEVEL_5,
+    EMHASS_MODES,
+    EMHASS_MODE_OFF,
+    EMHASS_MODE_CHARGE,
+    EMHASS_MODE_HOLD,
+    CONF_EMHASS_HEARTBEAT_MINUTES,
+    DEFAULT_EMHASS_HEARTBEAT_MINUTES,
+    DEFAULT_EMHASS_TARGET_SOC,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -244,6 +251,17 @@ class MarstekCoordinator:
                     "rs485_mode": self.config.get(f"battery_{i}_rs485_mode_entity"),
                     "capacity_wh": self.config.get(f"battery_{i}_capacity_wh", DEFAULT_BATTERY_CAPACITY_WH),
                 })
+
+        # EMHASS mode state. The mode itself is not persisted (always "aus" after a restart);
+        # target SoC and charge power are restored by their number entities.
+        self._emhass_mode: str = EMHASS_MODE_OFF
+        self._emhass_mode_set_at: datetime | None = None
+        self._emhass_target_soc: int = DEFAULT_EMHASS_TARGET_SOC
+        self._emhass_charge_power: int = self.emhass_max_charge_power
+        # SoC target used by _calculate_battery_priority while EMHASS force-charges (None otherwise)
+        self._emhass_charge_soc_target: int | None = None
+        # Last applied (action, target) to detect changes; None while EMHASS is not in control
+        self._emhass_active_state: tuple[str, int | None] | None = None
     
     async def async_load_settings(self) -> None:
         """Fetch settings from the Store helper."""
@@ -482,6 +500,41 @@ class MarstekCoordinator:
     @property
     def price_current_ranking(self) -> float | None:
         return self._price_current_ranking
+
+    @property
+    def emhass_mode(self) -> str:
+        return self._emhass_mode
+
+    @property
+    def emhass_target_soc(self) -> int:
+        return int(self._emhass_target_soc)
+
+    @property
+    def emhass_charge_power(self) -> int:
+        return int(self._emhass_charge_power)
+
+    @property
+    def emhass_max_charge_power(self) -> int:
+        try:
+            max_charge_power = int(self.config.get(CONF_MAX_CHARGE_POWER, DEFAULT_MAX_CHARGE_POWER))
+        except (ValueError, TypeError):
+            max_charge_power = int(DEFAULT_MAX_CHARGE_POWER)
+        return max_charge_power * max(1, len(self._batteries))
+
+    def set_emhass_mode(self, mode: str) -> None:
+        """Set the EMHASS mode. Every call (even with the same value) renews the heartbeat."""
+        if mode not in EMHASS_MODES:
+            raise ValueError(f"Invalid EMHASS mode '{mode}'. Valid: {EMHASS_MODES}")
+        if mode != self._emhass_mode:
+            _LOGGER.info("EMHASS mode set to '%s'.", mode)
+        self._emhass_mode = mode
+        self._emhass_mode_set_at = datetime.now() if mode != EMHASS_MODE_OFF else None
+
+    def set_emhass_target_soc(self, value: float) -> None:
+        self._emhass_target_soc = int(max(0, min(100, round(float(value)))))
+
+    def set_emhass_charge_power(self, value: float) -> None:
+        self._emhass_charge_power = int(max(0, min(self.emhass_max_charge_power, round(float(value)))))
 
     @property
     def solar_forecast_enabled(self) -> bool:
@@ -1108,6 +1161,133 @@ class MarstekCoordinator:
         _LOGGER.debug("Price is normal (ranking=%.2f). Normal algorithm active.", ranking)
         return False
 
+    def _get_emhass_effective_mode(self) -> str:
+        """Return the effective EMHASS mode, falling back to "aus" once the heartbeat expired."""
+        if self._emhass_mode == EMHASS_MODE_OFF:
+            return EMHASS_MODE_OFF
+
+        try:
+            heartbeat_minutes = float(
+                self.config.get(CONF_EMHASS_HEARTBEAT_MINUTES, DEFAULT_EMHASS_HEARTBEAT_MINUTES)
+                or DEFAULT_EMHASS_HEARTBEAT_MINUTES
+            )
+        except (TypeError, ValueError):
+            heartbeat_minutes = float(DEFAULT_EMHASS_HEARTBEAT_MINUTES)
+
+        if (
+            self._emhass_mode_set_at is None
+            or datetime.now() - self._emhass_mode_set_at > timedelta(minutes=heartbeat_minutes)
+        ):
+            _LOGGER.warning(
+                "EMHASS mode '%s' was not renewed within %s minutes. Falling back to '%s'.",
+                self._emhass_mode, heartbeat_minutes, EMHASS_MODE_OFF,
+            )
+            self._emhass_mode = EMHASS_MODE_OFF
+            self._emhass_mode_set_at = None
+            if getattr(self, "hass", None) is not None:
+                async_dispatcher_send(self.hass, SIGNAL_DIAGNOSTICS_UPDATED)
+            return EMHASS_MODE_OFF
+
+        return self._emhass_mode
+
+    async def _recalculate_emhass_priority(self) -> None:
+        await self._calculate_battery_priority()
+        self._last_priority_update = datetime.now()
+        self._priority_list_power_direction = self._last_power_direction
+
+    async def _handle_emhass_mode(self) -> bool:
+        """Apply the EMHASS mode written by Home Assistant.
+
+        * ``aus``: nothing to do, returns False (price logic / PID continue).
+        * ``halten``: all batteries at 0W, returns True.
+        * ``laden``: grid-charge up to the target SoC with at most the configured
+          charge power, ignoring the charge switches and price blocks. Once the
+          target is reached (or no battery is eligible / SoC unknown) it holds.
+        """
+        mode = self._get_emhass_effective_mode()
+
+        if mode == EMHASS_MODE_OFF:
+            if self._emhass_active_state is not None:
+                _LOGGER.info("EMHASS mode released control. Normal algorithm takes over.")
+                self._emhass_active_state = None
+                self._emhass_charge_soc_target = None
+                self._battery_priority = []  # Force recalculation without the EMHASS overrides
+            return False
+
+        # EMHASS has precedence over the price logic: drop its transient state.
+        self._price_is_cheap = False
+        self._price_is_expensive = False
+        self._price_current_ranking = None
+        self._price_cheap_charge_soc_override = None
+
+        if mode == EMHASS_MODE_CHARGE and await self._emhass_charge():
+            return True
+
+        # halten (also used when laden cannot or need not charge)
+        self._emhass_charge_soc_target = None
+        state = (EMHASS_MODE_HOLD, None)
+        if state != self._emhass_active_state:
+            _LOGGER.info("EMHASS mode: holding batteries at 0W (requested mode '%s').", mode)
+            self._emhass_active_state = state
+        self._last_power_direction = PowerDir.NEUTRAL
+        self._battery_priority = []
+        await self._set_all_batteries_to_zero()
+        return True
+
+    async def _emhass_charge(self) -> bool:
+        """Grid-charge for EMHASS mode ``laden``. Returns False if the caller should hold instead."""
+        try:
+            max_soc = float(self.config.get(CONF_MAX_SOC, DEFAULT_MAX_SOC) or DEFAULT_MAX_SOC)
+        except (TypeError, ValueError):
+            max_soc = float(DEFAULT_MAX_SOC)
+        target = int(min(float(self._emhass_target_soc), max_soc))
+
+        socs = [self._get_float_state(batt["soc"]) for batt in self._batteries]
+        known_socs = [soc for soc in socs if soc is not None]
+        if not known_socs:
+            _LOGGER.debug("EMHASS laden: no battery SoC available. Holding.")
+            return False
+        if not any(soc < target for soc in known_socs):
+            _LOGGER.debug("EMHASS laden: target SoC %d%% reached. Holding.", target)
+            return False
+        if self._emhass_charge_power <= 0:
+            _LOGGER.debug("EMHASS laden: charge power is 0W. Holding.")
+            return False
+
+        self._last_power_direction = PowerDir.CHARGE
+        self._emhass_charge_soc_target = target
+
+        state = (EMHASS_MODE_CHARGE, target)
+        if state != self._emhass_active_state:
+            _LOGGER.info(
+                "EMHASS mode: grid-charging up to %d%% SoC with max %dW.", target, self._emhass_charge_power,
+            )
+            self._emhass_active_state = state
+            await self._recalculate_emhass_priority()
+        elif any(
+            (soc := self._get_float_state(b["soc"])) is None or soc >= target
+            for b in self._battery_priority
+        ) or not self._battery_priority:
+            # A battery reached the target (or lost its SoC): rebuild the list.
+            await self._recalculate_emhass_priority()
+
+        if not self._battery_priority:
+            _LOGGER.debug("EMHASS laden: no eligible batteries. Holding.")
+            self._emhass_charge_soc_target = None
+            return False
+
+        try:
+            max_charge_power = int(self.config.get(CONF_MAX_CHARGE_POWER, DEFAULT_MAX_CHARGE_POWER))
+        except (ValueError, TypeError):
+            max_charge_power = int(DEFAULT_MAX_CHARGE_POWER)
+
+        num_batteries = len(self._battery_priority)
+        total_power = float(min(self._emhass_charge_power, max_charge_power * num_batteries))
+        # Grid charging must not be throttled by the solar forecast spreading.
+        self._solar_forecast_charge_factor = 1.0
+        await self._distribute_power(total_power, num_batteries)
+        return True
+
     async def _async_update(self, now=None):
         """Fetch new data and run the logic."""
         # Note: logging is handled by _run_update to include a reason.
@@ -1150,6 +1330,13 @@ class MarstekCoordinator:
             self._solar_forecast_charge_factor = self._compute_solar_charge_factor()
         else:
             self._solar_forecast_charge_factor = 1.0
+
+        # EMHASS mode (written by a HA automation) has precedence over price logic and PID.
+        emhass_took_control = await self._handle_emhass_mode()
+        if emhass_took_control:
+            _LOGGER.debug("EMHASS mode took control. Ending update cycle.")
+            self._reset_pid_state()
+            return
 
         # Price-based control: force-charge when cheap, block discharge when cheap,
         # block charging when expensive.
@@ -1791,8 +1978,13 @@ class MarstekCoordinator:
             self._battery_priority = []
             return
         
+        # EMHASS force-charge bypasses the charge switch and the price blocks.
+        emhass_charging = (
+            self._emhass_charge_soc_target is not None and self._last_power_direction == PowerDir.CHARGE
+        )
+
         # If charging or discharging is not allowed, set priority to empty to prevent any battery from being used in that direction.
-        if self._allow_charging is False and self._last_power_direction == PowerDir.CHARGE:
+        if not emhass_charging and self._allow_charging is False and self._last_power_direction == PowerDir.CHARGE:
             self._battery_priority = []
             _LOGGER.debug("Charging is disabled. Setting battery priority to empty for charging.")
             return
@@ -1802,7 +1994,7 @@ class MarstekCoordinator:
             return
 
         # Price-based overrides: block discharge when price is cheap, block charging when expensive.
-        if self._price_control_enabled:
+        if self._price_control_enabled and not emhass_charging:
             if self._price_is_cheap and self._last_power_direction == PowerDir.DISCHARGE:
                 self._battery_priority = []
                 _LOGGER.debug("Price control: cheap price — blocking discharge to conserve charge for expensive periods.")
@@ -1828,6 +2020,8 @@ class MarstekCoordinator:
             if (self._price_control_enabled and self._price_cheap_charge_soc_override is not None)
             else max_soc
         )
+        if emhass_charging:
+            effective_max_soc = float(cast(int, self._emhass_charge_soc_target))
 
         available_batteries = []
         missing_soc: list[str] = []
@@ -1840,7 +2034,11 @@ class MarstekCoordinator:
             batt_copy = dict(batt)
             batt_copy["current_soc"] = soc
 
-            if self._last_power_direction == PowerDir.CHARGE and soc <= effective_max_soc:
+            if emhass_charging:
+                # Strictly below the target, so a battery at the target is not charged further.
+                if soc < effective_max_soc:
+                    available_batteries.append(batt_copy)
+            elif self._last_power_direction == PowerDir.CHARGE and soc <= effective_max_soc:
                 available_batteries.append(batt_copy)
             elif self._last_power_direction == PowerDir.DISCHARGE and soc >= min_soc:
                 available_batteries.append(batt_copy)
