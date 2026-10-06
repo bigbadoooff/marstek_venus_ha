@@ -50,15 +50,25 @@ def _install_homeassistant_stubs() -> None:
     def async_dispatcher_send(*args, **kwargs):  # pragma: no cover
         return None
 
+    def async_dispatcher_connect(*args, **kwargs):  # pragma: no cover
+        return lambda: None
+
     class Store:  # pragma: no cover
         def __init__(self, *args, **kwargs):
             pass
+
+        async def async_load(self):
+            return None
+
+        async def async_save(self, data):
+            return None
 
     helpers.event = helpers_event
     helpers.dispatcher = helpers_dispatcher
     helpers.storage = helpers_storage
     helpers_event.async_track_state_change_event = async_track_state_change_event
     helpers_dispatcher.async_dispatcher_send = async_dispatcher_send
+    helpers_dispatcher.async_dispatcher_connect = async_dispatcher_connect
     helpers_storage.Store = Store
 
     ha_util.dt = ha_util_dt

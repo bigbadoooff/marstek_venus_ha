@@ -2,7 +2,7 @@
 
 DOMAIN = "marstek_venus_ha"
 
-PLATFORMS: list[str] = ["sensor", "switch"]
+PLATFORMS: list[str] = ["sensor", "switch", "select", "number"]
 
 SIGNAL_DIAGNOSTICS_UPDATED = f"{DOMAIN}_diagnostics_updated"
 
@@ -122,3 +122,14 @@ CONF_SOLAR_FORECAST_SENSOR = "solar_forecast_sensor"
 CONF_SOLAR_FORECAST_TRIGGER_BUFFER = "solar_forecast_trigger_buffer"
 DEFAULT_BATTERY_CAPACITY_WH = 5000
 DEFAULT_SOLAR_FORECAST_TRIGGER_BUFFER = 0.1  # start charging when remaining solar ≤ energy_needed × 1.1
+
+# EMHASS mode: external optimizer (e.g. EMHASS via a HA automation) drives grid charging / holding
+EMHASS_MODE_OFF = "aus"
+EMHASS_MODE_CHARGE = "laden"
+EMHASS_MODE_HOLD = "halten"
+EMHASS_MODES = [EMHASS_MODE_OFF, EMHASS_MODE_CHARGE, EMHASS_MODE_HOLD]
+
+# A written mode is only valid for this long; afterwards the effective mode falls back to "aus".
+CONF_EMHASS_HEARTBEAT_MINUTES = "emhass_heartbeat_minutes"
+DEFAULT_EMHASS_HEARTBEAT_MINUTES = 10
+DEFAULT_EMHASS_TARGET_SOC = 80
