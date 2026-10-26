@@ -2306,6 +2306,20 @@ class MarstekCoordinator:
             else:
                 await self._set_battery_power(batt, 0, 0)
 
+    def _get_force_mode_idle_option(self, force_mode: str) -> str:
+        """Return the force mode option that idles the battery.
+
+        Depending on the Modbus integration version the option is called
+        "stop" or "standby". Falls back to "stop" if the options are unknown.
+        """
+        state = self.hass.states.get(force_mode)
+        options = state.attributes.get("options") if state else None
+        if options:
+            for candidate in ("stop", "standby"):
+                if candidate in options:
+                    return candidate
+        return "stop"
+
     async def _set_battery_power(self, batt: dict, power: int, direction: int):
         """Set the charge or discharge power for a single battery."""
         charge_entity = batt["charge_power"]
@@ -2381,13 +2395,14 @@ class MarstekCoordinator:
                     {"entity_id": discharge_entity, "value": 0},
                     blocking=True,
                 )
+                idle_option = self._get_force_mode_idle_option(force_mode)
                 await self._async_call_cached(
                     "select",
                     "select_option",
                     force_mode,
                     "option",
-                    "stop",
-                    {"entity_id": force_mode, "option": "stop"},
+                    idle_option,
+                    {"entity_id": force_mode, "option": idle_option},
                     blocking=True,
                 )
 

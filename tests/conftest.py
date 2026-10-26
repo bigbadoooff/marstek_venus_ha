@@ -1,5 +1,6 @@
 import sys
 import types
+from datetime import timezone
 from pathlib import Path
 
 
@@ -14,7 +15,11 @@ def _install_homeassistant_stubs() -> None:
     config_entries = types.ModuleType("homeassistant.config_entries")
     helpers = types.ModuleType("homeassistant.helpers")
     helpers_event = types.ModuleType("homeassistant.helpers.event")
+    helpers_dispatcher = types.ModuleType("homeassistant.helpers.dispatcher")
+    helpers_storage = types.ModuleType("homeassistant.helpers.storage")
     ha_const = types.ModuleType("homeassistant.const")
+    ha_util = types.ModuleType("homeassistant.util")
+    ha_util_dt = types.ModuleType("homeassistant.util.dt")
 
     class HomeAssistant:  # pragma: no cover
         pass
@@ -42,8 +47,22 @@ def _install_homeassistant_stubs() -> None:
 
     config_entries.ConfigEntry = ConfigEntry
 
+    def async_dispatcher_send(*args, **kwargs):  # pragma: no cover
+        return None
+
+    class Store:  # pragma: no cover
+        def __init__(self, *args, **kwargs):
+            pass
+
     helpers.event = helpers_event
+    helpers.dispatcher = helpers_dispatcher
+    helpers.storage = helpers_storage
     helpers_event.async_track_state_change_event = async_track_state_change_event
+    helpers_dispatcher.async_dispatcher_send = async_dispatcher_send
+    helpers_storage.Store = Store
+
+    ha_util.dt = ha_util_dt
+    ha_util_dt.DEFAULT_TIME_ZONE = timezone.utc
 
     ha_const.STATE_UNAVAILABLE = "unavailable"
     ha_const.STATE_UNKNOWN = "unknown"
@@ -54,7 +73,11 @@ def _install_homeassistant_stubs() -> None:
     sys.modules.setdefault("homeassistant.config_entries", config_entries)
     sys.modules.setdefault("homeassistant.helpers", helpers)
     sys.modules.setdefault("homeassistant.helpers.event", helpers_event)
+    sys.modules.setdefault("homeassistant.helpers.dispatcher", helpers_dispatcher)
+    sys.modules.setdefault("homeassistant.helpers.storage", helpers_storage)
     sys.modules.setdefault("homeassistant.const", ha_const)
+    sys.modules.setdefault("homeassistant.util", ha_util)
+    sys.modules.setdefault("homeassistant.util.dt", ha_util_dt)
 
 
 _install_homeassistant_stubs()
