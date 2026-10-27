@@ -176,3 +176,19 @@ The integration provides dedicated switches in Home Assistant to manually overri
 * **Discharging Allowed** (`switch.*._discharging_switch`): Manually allow/block the batteries from discharging into the house.
 * **Wallbox Priority** (`switch.*._wallbox_priority_switch`): Enable/disable the logic that prioritizes the EV over home batteries.
 * **Block battery discharge while car charging** (`switch.*._discharge_blocker_cc_switch`): Standard protection. If disabled, your home batteries are allowed to discharge into your EV.
+
+### EMHASS mode (external optimizer control)
+An external optimizer such as [EMHASS](https://emhass.readthedocs.io/) can take direct control of grid charging and holding through three entities. A Home Assistant automation writes them.
+
+| Entity | Values | Purpose |
+|---|---|---|
+| `select.emhass_mode` | `aus` / `laden` / `halten` | `laden`: charge from the grid up to the target SoC, no discharging. `halten`: all batteries at 0W in both directions. `aus`: normal operation (price logic, PID, staging). |
+| `number.emhass_target_soc` | 0–100 %, step 1 | Target for `laden`. Once all batteries reach it, `laden` behaves like `halten`. The configured max SoC is still an upper limit. |
+| `number.emhass_charge_power` | 0 to max charge power × number of batteries, step 100 W | Upper limit for the total grid charge power in `laden`. |
+
+Rules:
+* **Precedence:** Wallbox logic > EMHASS mode > price-based control > PID / staging.
+* **Heartbeat:** A written mode is valid for 10 minutes (optional config key `emhass_heartbeat_minutes`). Selecting the same option again renews it. Without a renewal the mode falls back to `aus` and a warning is logged. The automation should therefore write `select.emhass_mode` at least every 5 minutes, and set target SoC and charge power **before** selecting `laden`.
+* **Overrides:** In `laden` the *Allow Charging* switch and the price-based blocks are ignored, and solar forecast charge spreading does not throttle the grid charge. In `aus` everything behaves as before.
+* **Safety:** If no battery SoC is available, no battery is eligible or the charge power is 0W, `laden` holds instead. Batteries with an unknown SoC are not charged.
+* **Restart:** The mode is not persisted and starts as `aus`. Target SoC and charge power are restored.
